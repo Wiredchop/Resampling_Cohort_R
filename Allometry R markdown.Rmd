@@ -1,0 +1,218 @@
+---
+title: "Dataset Resampling"
+author: "Simon Choppin"
+date: "2022-12-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This case study in R demonstrates a method I used to resample a dataset to remove bias within it. We were examining allometric scaling of the human torso. For any specific measurement, $X_i$ the allometric scaling law can be applied such that:
+\begin{equation}
+\tag{1}
+X_i = \alpha_iH^{\beta_i}
+\end{equation}
+Where $\alpha$ and $\beta$ are parameters and $H$ is the height of the individual.
+Unfortunately in this dataset there was bias, the body mass index was not independent of height (plotted below). This exercise attempted to randomly remove individuals from the dataset to remove this bias, but to do so as efficiently as possible.
+
+## The Dataset
+
+The dataset  obtained via a data sharing agreement with the [LIFE-Adult-Study](http://dx.doi.org/10.1186/s12889-015-1983-z). The element we accessed consisted of almost 10,000 individual body scans from which size data could be obtained.
+I have not included loading the dataset in this markdown document but separate data frames were loaded containing the measurement information and the gender information. Resampling was done on a per gender basis. 
+
+## The Code
+Many of the standard libraries were loaded for data manipulation and visualisation
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(data.table)
+#Load saved data
+load('c:\\saved_DAT.Rdata')
+```
+
+
+Trimmed down data frames were created for simpler operation, the unique key of each data frame was named the same to make union operations easier to code
+```{r data}
+Dat_Gender_trim <- data.table(SIC = Dat_Gender$SIC,GENDER = Dat_Gender$ADULT_PROB_GENDER,AGE = Dat_Gender$ADULT_PROB_AGE)
+Dat_Measures_trim <- data.table(SIC = Dat_Measures$BS_SIC, WAIST_GTH = Dat_Measures$BS_WAIST_GTH, HEIGHT = Dat_Measures$BS_HT, BMI = Dat_Measures$BS_BMI)
+names(Dat_Measures_trim)[names(Dat_Measures_trim) == "Dat_Measures.BS_SIC"]<-"Dat_Measures.SIC"
+```
+
+A single data table was created by performing a union operation so Gender could be combined with measures (BMI etc.)
+``` {r join data tables}
+setkey(Dat_Gender_trim,SIC)
+setkey(Dat_Measures_trim,SIC)
+Dat <- Dat_Gender_trim[Dat_Measures_trim]
+```
+
+## The Bias
+
+As can be observed, BMI tends to decrease with height rather than being independent
+
+```{r plot height~BMI, warning = FALSE, echo=FALSE}
+#Create labels for Gender, Male = 1, Female = 2
+Dat$GENDER_L[Dat$GENDER == 1] <- "Male"
+Dat$GENDER_L[Dat$GENDER == 2] <- "Female"
+Dat$GENDER_L <- as.factor(Dat$GENDER_L)
+library(ggthemes)
+Dat %>%
+  ggplot(aes(x=HEIGHT, y = BMI)) + geom_point(alpha=0.25) +
+  facet_grid(rows = Dat$GENDER_L) +
+  xlim(130,210) + ylim (0,60) +
+  geom_smooth(method='lm', formula = y~x) +
+  ggtitle("BMI decreases with height")+ theme_economist()
+
+```
+``` {r remove outliers, echo = FALSE}
+# Remove outliers based on visual analysis, separate data based on gender
+Dat_Male <- Dat[Dat$GENDER == 1 & Dat$BMI < 100,]
+Dat_Female <- Dat[Dat$GENDER == 2 & Dat$BMI < 100,]
+
+Dat_Male <- Dat_Male[complete.cases(Dat_Male),]
+Dat_Male <- Dat_Male[Dat_Male$HEIGHT > 100,]
+
+Dat_Female <- Dat_Female[complete.cases(Dat_Female),]
+Dat_Female <- Dat_Female[Dat_Female$HEIGHT > 140,]
+```
+
+## Resampling
+To correct from this, random individuals were removed from the sample if they reduce the bias available. Simply, a random individual is selected. If the gradient is lower post-removal then they are taken from the sample. If not then another random individual is selected. 
+
+```{r resampling function, message=FALSE,warning=FALSE}
+One_at_time = function(Dat_sample){
+  original_SIC <- Dat_sample$SIC
+  n_orig <- nrow(Dat_sample) # number of rows in original sample
+  f <- lm(BMI ~ HEIGHT, data = Dat_sample) # The original linear fit
+  mbest <- f$coefficients[2] # The original gradient
+  m <- 100 # place holder for gradient of that iteration
+  while(abs(mbest) > 0.00001){ # Will continue removing samples until the gradient is lower than 1 in 100,000
+    n <- nrow(Dat_sample)
+    while(abs(m)>abs(mbest)){
+      samp <- sample(n,n-1)
+      Dat_test <- Dat_sample[samp,]
+      
+      # Find gradient of BMI~Height
+      f <- lm(BMI ~ HEIGHT, data = Dat_test)
+      m <- f$coefficients[2]
+      if (abs(m)>abs(mbest)) {
+        print("Not improved, trying another sample")
+      }
+    }
+    Dat_sample <- Dat_test
+    mbest <- m
+    disp_string <- paste("Size of sample: ",n, " Best gradient: ", m," % reduction: ",100*(1- n/n_orig)) 
+    
+    m<- 100 # reset gradient value
+        print(disp_string) # Print some information regarding each iteration
+  }
+  removed_SIC <-original_SIC[!(original_SIC %in% Dat_sample$SIC)]
+  return(list(removed_SIC,Dat_sample))
+}
+```
+
+
+We can create a sampled data frame which has gone through the resampling algorithm
+```{r female resampling,results='hide'}
+output_female <- One_at_time(Dat_Female)
+Removed_females <- output_female[[1]]
+Removed_females <- Dat_Female[(Dat_Female$SIC %in% Removed_females),]
+Dat_Female_sampled <- output_female[[2]]
+```
+
+```{r male resampling,results='hide'}
+output_male <- One_at_time(Dat_Male)
+Removed_males <- output_male[[1]]
+Removed_males <- Dat_Male[(Dat_Male$SIC %in% Removed_males),]
+Dat_Male_sampled <- output_male[[2]]
+```
+and compare it with the original cohort. 
+
+The full female cohort contained `r nrow(Dat_Female)` samples. After re-sampling this was reduced to `r nrow(Dat_Female_sampled)`, a reduction of `r paste(round(100*(1-nrow(Dat_Female_sampled)/nrow(Dat_Female))),'%')`.
+
+The full male cohort contained `r nrow(Dat_Male)` samples. After re-sampling this was reduced to `r nrow(Dat_Male_sampled)`, a reduction of `r paste(round(100*(1-nrow(Dat_Male_sampled)/nrow(Dat_Male))),'%')`.
+
+Let's examine the mean BMI values for different height ranges, for the original data and the resampled data
+
+``` {r mean BMI values over different ranges for females, echo=FALSE, warning = FALSE, include=FALSE}
+library(kableExtra)
+#Range of original female cohort
+Dat_Female_range <- Dat_Female %>%
+  mutate(height_range = cut(HEIGHT,
+                            seq(120,200,20))) %>%
+  group_by(height_range) %>%
+  dplyr::summarise(n = n(),BMI = mean(BMI)) %>%
+  as.data.frame()
+kable(Dat_Female_range,caption = "The original data: female") %>%
+  kable_classic()
+#Range of sampled female cohort
+Dat_Female_range_s <- Dat_Female_sampled %>%
+  mutate(height_range = cut(HEIGHT,
+                            seq(120,200,20))) %>%
+  group_by(height_range) %>%
+  dplyr::summarise(n = n(),BMI = mean(BMI)) %>%
+  as.data.frame()
+kable(Dat_Female_range_s,caption = "The resampled data: female", results = 'asis') %>%
+  kable_classic()
+```
+
+```{r mean BMI values over different ranges for male, echo=FALSE, results = 'asis',warning=FALSE}
+Dat_Male_range <- Dat_Male %>%
+  mutate(height_range = cut(HEIGHT,
+                            seq(150,210,20))) %>%
+  group_by(height_range) %>%
+  dplyr::summarise(n = n(),BMI = mean(BMI)) %>%
+  as.data.frame()
+kable(Dat_Male_range) %>%
+  kable_classic()
+
+Dat_Male_range_s <- Dat_Male_sampled %>%
+  mutate(height_range = cut(HEIGHT,
+                            seq(150,210,20))) %>%
+  group_by(height_range) %>%
+  dplyr::summarise(n = n(),BMI = mean(BMI)) %>%
+  as.data.frame()
+kable(Dat_Male_range_s) %>%
+  kable_classic()
+```
+
+If we look at the linear fit of Height~BMI then the gradient is effectively flat. Pearson R values for are `r cor(Dat_Female_sampled$HEIGHT, Dat_Female_sampled$BMI, method = 'pearson')` for the resampled female cohort and `r cor(Dat_Male_sampled$HEIGHT, Dat_Male_sampled$BMI, method = 'pearson')` for the resampled male cohort. 
+
+```{r plot height~BMI re sampled, warning = FALSE, echo=FALSE}
+#Create labels for Gender, Male = 1, Female = 2
+library(ggthemes)
+ff <-  ggplot(Dat_Female_sampled, aes(x=HEIGHT, y = BMI)) + geom_point(alpha=0.25) +
+  xlim(130,210) + ylim (0,60) +
+  geom_smooth(method='lm', formula = y~x) +
+  theme_economist() +
+  annotate(geom="text", x=205, y=50, label="Female",size=5,
+              color="black")
+m <-  ggplot(Dat_Male_sampled, aes(x=HEIGHT, y = BMI)) + geom_point(alpha=0.25) +
+  xlim(130,210) + ylim (0,60) +
+  geom_smooth(method='lm', formula = y~x) +
+  theme_economist()+ ggtitle('Linear fits for resampled cohorts') +
+  annotate(geom="text", x=205, y=50, label="Male",size=5,
+              color="black")
+grid.arrange(m,ff) 
+```
+
+## Next Steps
+Once we have the resampled data set we can find the representative coefficients $\alpha$ and $\beta$ in the cohort using a transformation of equation 1:
+\begin{equation}
+\tag{2}
+ln(X_i) = ln(\alpha_i) + \beta_i\cdot ln(H)
+\end{equation}
+A regression line through a plot of $ln(X_i)$ and $ln(H)$ gives $\beta$ as the gradient and $ln(\alpha)$ as the intercept. The function below could be used for this purpose
+
+``` {r, warning = FALSE}
+get_allometric_coefficients = function(data,name_of_variable){
+  variable_vector = data[,name_of_variable]
+  linear_model <- lm(log(variable_vector) ~ log(data$HEIGHT), data = data)
+  return(linear_model$coefficients)
+}
+```
